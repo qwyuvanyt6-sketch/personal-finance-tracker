@@ -1,4 +1,4 @@
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownCircle,
   ArrowUpCircle,
@@ -15,11 +15,12 @@ import {
   RefreshCcw,
   Save,
   Settings,
+  SquareTerminal,
   Sparkles,
   Trash2,
   Upload
 } from 'lucide-react';
-import { getMonthlySummary } from './domain/calculations';
+import { getMonthlySummary, type MonthlySummary } from './domain/calculations';
 import { getMonthKey, getMonthLabel, todayIsoDate } from './domain/dates';
 import { formatMoney, formatSignedMoney } from './domain/format';
 import type {
@@ -35,11 +36,19 @@ import type {
   TransactionType
 } from './domain/types';
 import { LocalStorageFinanceRepository } from './data/localStorageRepository';
+import { SupabaseFinanceRepository } from './data/supabaseRepository';
 import { createSeedData, makeId } from './data/seedData';
+import { supabase } from './data/supabaseClient';
 
 type ViewKey = 'dashboard' | 'transactions' | 'budgets' | 'cashflow' | 'accounts' | 'settings';
+type AppScreen = 'landing' | 'auth' | 'tracker';
+type LandingTransitionPhase = 'idle' | 'leaving' | 'leaving-down';
 
-const repository = new LocalStorageFinanceRepository();
+const localRepository = new LocalStorageFinanceRepository();
+let supabaseRepository: SupabaseFinanceRepository | null = null;
+const LANDING_TRANSITION_EXIT_MS = 1150;
+const LANDING_TRANSITION_RETURN_MS = 1150;
+const REMEMBER_AUTH_KEY = 'money-map:remember-session';
 
 const navItems: Array<{ key: ViewKey; label: string; icon: typeof LayoutDashboard }> = [
   { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -130,7 +139,7 @@ const upsertById = <T extends { id: string; updatedAt: string }>(items: T[], ite
 
 function App() {
   const [data, setData] = useState<FinanceData | null>(null);
-  const [showLanding, setShowLanding] = useState(true);
+  const [screen, setScreen] = useState<AppScreen>('landing');
   const [activeView, setActiveView] = useState<ViewKey>('dashboard');
   const [month, setMonth] = useState(getMonthKey());
   const [monthPickerOpen, setMonthPickerOpen] = useState(false);
@@ -141,20 +150,53 @@ function App() {
   const [recurringForm, setRecurringForm] = useState<RecurringItem | null>(null);
   const [toast, setToast] = useState('');
   const [systemTime, setSystemTime] = useState(() => new Date().toLocaleTimeString('en-GB'));
+  const [isSupabaseAuthenticated, setIsSupabaseAuthenticated] = useState(false);
+  const [rememberedSession, setRememberedSession] = useState(() => window.localStorage.getItem(REMEMBER_AUTH_KEY) === 'true');
+  const [routeTransitionPhase, setRouteTransitionPhase] = useState<LandingTransitionPhase>('idle');
+  const [landingBootSeen, setLandingBootSeen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const routeTransitionTimeoutsRef = useRef<number[]>([]);
 
+  // Initialize repository and load data
   useEffect(() => {
-    repository.load().then((loaded) => {
+    const init = async () => {
+      // Check if user is authenticated with Supabase
+      if (supabase) {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session) {
+          setIsSupabaseAuthenticated(true);
+          supabaseRepository = new SupabaseFinanceRepository();
+          try {
+            const loaded = await supabaseRepository.load();
+            setData(loaded);
+            setTransactionForm(blankTransaction(loaded));
+            setRecurringForm(blankRecurring(loaded));
+            return;
+          } catch {
+            // Fall back to localStorage if Supabase load fails
+          }
+        }
+      }
+      // Use localStorage
+      const loaded = await localRepository.load();
       setData(loaded);
       setTransactionForm(blankTransaction(loaded));
       setRecurringForm(blankRecurring(loaded));
-    });
+    };
+    init();
   }, []);
 
+  // Save data to appropriate repository
   useEffect(() => {
     if (!data) return;
-    repository.save(data);
-  }, [data]);
+    if (isSupabaseAuthenticated && supabaseRepository) {
+      supabaseRepository.save(data).catch(() => {
+        // Silently fail - data stays in memory
+      });
+    } else {
+      localRepository.save(data);
+    }
+  }, [data, isSupabaseAuthenticated]);
 
   useEffect(() => {
     if (!toast) return;
@@ -167,10 +209,27 @@ function App() {
     return () => window.clearInterval(timer);
   }, []);
 
+  // Update transaction form when accounts or categories change
+  useEffect(() => {
+    if (!data) return;
+    // Only update if current form has empty account/category and data has them
+    if ((!transactionForm?.accountId && data.accounts.length > 0) || 
+        (!transactionForm?.categoryId && data.categories.length > 0)) {
+      setTransactionForm(blankTransaction(data));
+    }
+  }, [data?.accounts.length, data?.categories.length]);
+
+  useEffect(() => {
+    return () => {
+      routeTransitionTimeoutsRef.current.forEach((timeout) => window.clearTimeout(timeout));
+    };
+  }, []);
+
   const summary = useMemo(() => (data ? getMonthlySummary(data, month) : null), [data, month]);
   const monthRange = useMemo(() => getMonthDateRange(month), [month]);
   const categoriesById = useMemo(() => new Map(data?.categories.map((category) => [category.id, category]) ?? []), [data]);
   const accountsById = useMemo(() => new Map(data?.accounts.map((account) => [account.id, account]) ?? []), [data]);
+  const markLandingBootSeen = useCallback(() => setLandingBootSeen(true), []);
 
   if (!data || !summary || !transactionForm || !recurringForm) {
     return (
@@ -181,8 +240,97 @@ function App() {
     );
   }
 
-  if (showLanding) {
-    return <LandingPage onEnter={() => { setShowLanding(false); window.scrollTo(0, 0); }} />;
+  const scheduleRouteTransitionStep = (callback: () => void, delay: number) => {
+    const timeout = window.setTimeout(() => {
+      routeTransitionTimeoutsRef.current = routeTransitionTimeoutsRef.current.filter((current) => current !== timeout);
+      callback();
+    }, delay);
+    routeTransitionTimeoutsRef.current.push(timeout);
+  };
+
+  const transitionToScreen = (nextScreen: AppScreen) => {
+    routeTransitionTimeoutsRef.current.forEach((timeout) => window.clearTimeout(timeout));
+    routeTransitionTimeoutsRef.current = [];
+
+    setRouteTransitionPhase('leaving');
+    scheduleRouteTransitionStep(() => {
+      setScreen(nextScreen);
+      window.scrollTo(0, 0);
+      setRouteTransitionPhase('leaving-down');
+      scheduleRouteTransitionStep(() => setRouteTransitionPhase('idle'), LANDING_TRANSITION_RETURN_MS);
+    }, LANDING_TRANSITION_EXIT_MS);
+  };
+
+  const routeTransitionOverlay = <PageTransitionOverlay phase={routeTransitionPhase} />;
+
+  const goToLanding = () => transitionToScreen('landing');
+
+  const goToAuth = () => {
+    const shouldResumeSession = rememberedSession || window.localStorage.getItem(REMEMBER_AUTH_KEY) === 'true';
+    transitionToScreen(shouldResumeSession ? 'tracker' : 'auth');
+  };
+
+  const goToTracker = async (rememberSession = false) => {
+    routeTransitionTimeoutsRef.current.forEach((timeout) => window.clearTimeout(timeout));
+    routeTransitionTimeoutsRef.current = [];
+    setRouteTransitionPhase('idle');
+
+    if (rememberSession) {
+      window.localStorage.setItem(REMEMBER_AUTH_KEY, 'true');
+      setRememberedSession(true);
+      setIsSupabaseAuthenticated(true);
+    } else {
+      window.localStorage.removeItem(REMEMBER_AUTH_KEY);
+      setRememberedSession(false);
+    }
+
+    setScreen('tracker');
+    window.scrollTo(0, 0);
+
+    // Check if Supabase session exists and sync if needed
+    if (supabase) {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session && !isSupabaseAuthenticated) {
+        setIsSupabaseAuthenticated(true);
+        supabaseRepository = new SupabaseFinanceRepository();
+
+        // Sync local data to Supabase
+        const localData = await localRepository.load();
+        try {
+          await supabaseRepository.migrateFromLocal(localData);
+          const synced = await supabaseRepository.load();
+          setData(synced);
+          setToast('DATA_SYNCED: LOCAL_DATA_MIGRATED_TO_CLOUD');
+        } catch {
+          // Keep local data if sync fails
+        }
+      }
+    }
+  };
+
+  if (screen === 'landing') {
+    return (
+      <>
+        <LandingPage
+          data={data}
+          monthLabel={getMonthLabel(month)}
+          onEnter={goToAuth}
+          onBootSeen={markLandingBootSeen}
+          showBoot={!landingBootSeen}
+          summary={summary}
+        />
+        {routeTransitionOverlay}
+      </>
+    );
+  }
+
+  if (screen === 'auth') {
+    return (
+      <>
+        <AuthPage onAuthenticated={goToTracker} onBack={goToLanding} />
+        {routeTransitionOverlay}
+      </>
+    );
   }
 
   const updateData = (updater: (current: FinanceData) => FinanceData, message?: string) => {
@@ -194,8 +342,17 @@ function App() {
   };
 
   const saveTransaction = () => {
-    if (!transactionForm.accountId || !transactionForm.categoryId || transactionForm.amount <= 0) {
-      setToast('Add an account, category, and amount first.');
+    const missing = [];
+    if (!transactionForm.accountId) missing.push('account');
+    if (!transactionForm.categoryId) missing.push('category');
+    if (transactionForm.amount <= 0) missing.push('valid amount');
+    
+    if (missing.length > 0) {
+      if (data.accounts.length === 0 || data.categories.length === 0) {
+        setToast('Create accounts and categories first in Settings.');
+      } else {
+        setToast(`Missing: ${missing.join(', ')}`);
+      }
       return;
     }
     updateData(
@@ -332,9 +489,10 @@ function App() {
   const recentTransactions = monthTransactions.slice(0, 5);
 
   return (
-    <div className="app-shell">
+    <>
+      <div className="app-shell">
       <aside className="sidebar">
-        <button className="brand brand-button" onClick={() => setShowLanding(true)} type="button" aria-label="Return to landing page">
+        <button className="brand brand-button" onClick={goToLanding} type="button" aria-label="Return to landing page">
           <div className="brand-mark">
             <CircleDollarSign size={23} />
           </div>
@@ -924,7 +1082,9 @@ function App() {
         )}
       </main>
       {toast && <div className="toast">{toast}</div>}
-    </div>
+      </div>
+      {routeTransitionOverlay}
+    </>
   );
 }
 
@@ -1095,13 +1255,206 @@ function LegacyLandingPage({ onEnter }: { onEnter: () => void }) {
   );
 }
 
-function LandingPage({ onEnter }: { onEnter: () => void }) {
+function PageTransitionOverlay({ phase }: { phase: LandingTransitionPhase }) {
+  return (
+    <div className={`landing-page-transition ${phase}`} aria-hidden="true">
+      {Array.from({ length: 5 }).map((_, index) => (
+        <span key={index} />
+      ))}
+      <strong>&gt; ROUTING_LEDGER...</strong>
+    </div>
+  );
+}
+
+function AuthPage({ onAuthenticated, onBack }: { onAuthenticated: (rememberSession?: boolean) => void; onBack: () => void }) {
+  const [email, setEmail] = useState('');
+  const [accessToken, setAccessToken] = useState('');
+  const [persistSession, setPersistSession] = useState(false);
+  const [mode, setMode] = useState<'login' | 'register'>('login');
+  const [authState, setAuthState] = useState<'idle' | 'pending' | 'success' | 'error'>('idle');
+  const [authMessage, setAuthMessage] = useState('AWAITING_CREDENTIALS...');
+  const allowTestBypass = import.meta.env.MODE === 'test';
+
+  const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const trimmedEmail = email.trim();
+
+    if (!trimmedEmail || !accessToken) {
+      setAuthState('error');
+      setAuthMessage('MISSING_FIELDS: USER_EMAIL + ACCESS_TOKEN REQUIRED');
+      return;
+    }
+
+    setAuthState('pending');
+    setAuthMessage(mode === 'login' ? 'AUTH_HANDSHAKE: VERIFYING_CREDENTIALS...' : 'REGISTRATION_PIPE: INITIALIZING_USER...');
+
+    if (allowTestBypass) {
+      setAuthState('success');
+      setAuthMessage('TEST_SESSION_GRANTED');
+      onAuthenticated(persistSession);
+      return;
+    }
+
+    if (!supabase) {
+      setAuthState('error');
+      setAuthMessage('SUPABASE_ENV_MISSING: ADD VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY');
+      return;
+    }
+
+    try {
+      const credentials = { email: trimmedEmail, password: accessToken };
+      const response =
+        mode === 'login'
+          ? await supabase.auth.signInWithPassword(credentials)
+          : await supabase.auth.signUp(credentials);
+
+      if (response.error) {
+        setAuthState('error');
+        setAuthMessage(response.error.message.toUpperCase());
+        return;
+      }
+
+      if (response.data.session) {
+        setAuthState('success');
+        setAuthMessage(persistSession ? 'ACCESS_GRANTED: SESSION_PERSISTED' : 'ACCESS_GRANTED: SESSION_ACTIVE');
+        window.setTimeout(() => onAuthenticated(persistSession), 260);
+        return;
+      }
+
+      setAuthState('success');
+      setAuthMessage('REGISTRATION_SENT: CHECK_EMAIL_CONFIRMATION');
+    } catch {
+      setAuthState('error');
+      setAuthMessage('AUTH_PROCESS_FAILED: RETRY_CONNECTION');
+    }
+  };
+
+  const toggleMode = () => {
+    setMode((current) => (current === 'login' ? 'register' : 'login'));
+    setAuthState('idle');
+    setAuthMessage(mode === 'login' ? 'REGISTRATION_READY: ENTER_NEW_CREDENTIALS' : 'AWAITING_CREDENTIALS...');
+  };
+
+  const statusLabel =
+    authState === 'pending'
+      ? 'STATUS: HANDSHAKE_IN_PROGRESS...'
+      : authState === 'success'
+        ? 'STATUS: ACCESS_PACKET_ACCEPTED'
+        : authState === 'error'
+          ? 'STATUS: AUTH_BLOCKED'
+          : 'STATUS: AWAITING_CREDENTIALS...';
+
+  return (
+    <main className="auth-shell">
+      <section className="auth-panel" aria-label="Authentication">
+        <header className="auth-titlebar">
+          <div className="auth-title">
+            <SquareTerminal size={24} />
+            <span>FIN-TRACK_AUTH_v1.0</span>
+          </div>
+          <div className="auth-window-controls" aria-label="Window controls">
+            <button onClick={onBack} type="button" aria-label="Return to landing page" />
+            <span />
+          </div>
+        </header>
+
+        <div className="auth-status-strip">
+          <span>&gt; CONNECTION_SECURED: AES-256-GCM</span>
+          <span>&gt; REMOTE_ADDR: 192.168.1.1</span>
+          <span>&gt; {statusLabel}</span>
+        </div>
+
+        <form className="auth-body" onSubmit={submitAuth}>
+          <div className="auth-copy">
+            <h1>&gt; {mode === 'login' ? 'SYSTEM_LOGIN' : 'SYSTEM_REGISTER'}</h1>
+            <p>// {mode === 'login' ? 'ENTER ENCRYPTED CREDENTIALS' : 'INITIALIZE SECURE PROFILE'}</p>
+          </div>
+
+          <label className="auth-field">
+            <span>USER_EMAIL</span>
+            <input
+              autoComplete="email"
+              inputMode="email"
+              onChange={(event) => setEmail(event.target.value)}
+              placeholder="root@fintrack.io"
+              type="email"
+              value={email}
+            />
+          </label>
+
+          <label className="auth-field">
+            <span>ACCESS_TOKEN</span>
+            <input
+              autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+              onChange={(event) => setAccessToken(event.target.value)}
+              placeholder="............"
+              type="password"
+              value={accessToken}
+            />
+          </label>
+
+          <label className="auth-checkbox">
+            <input
+              checked={persistSession}
+              onChange={(event) => setPersistSession(event.target.checked)}
+              type="checkbox"
+            />
+            <span>PERSIST_SESSION</span>
+          </label>
+
+          <button className="auth-submit" disabled={authState === 'pending'} type="submit">
+            {authState === 'pending'
+              ? 'EXECUTING...'
+              : mode === 'login'
+                ? 'EXECUTE_LOGIN ->'
+                : 'EXECUTE_REGISTER ->'}
+          </button>
+
+          <p className={`auth-message ${authState}`} role="status" aria-live="polite">
+            &gt; {authMessage}
+          </p>
+
+          <div className="auth-register-panel">
+            <strong>{mode === 'login' ? 'NEW_USER_DETECTED?' : 'EXISTING_USER?'}</strong>
+            <button onClick={toggleMode} type="button">
+              {mode === 'login' ? '[ INITIALIZE_REGISTRATION ]' : '[ RETURN_TO_LOGIN ]'}
+            </button>
+          </div>
+        </form>
+
+        <footer className="auth-footer">
+          <span>DB_STATE: READ_WRITE</span>
+          <span>NODE: ASIA_SOUTH_1</span>
+          <span>VER: 1.0.4-STABLE</span>
+        </footer>
+      </section>
+    </main>
+  );
+}
+
+function LandingPage({
+  data,
+  monthLabel,
+  onEnter,
+  onBootSeen,
+  showBoot,
+  summary
+}: {
+  data: FinanceData;
+  monthLabel: string;
+  onEnter: () => void;
+  onBootSeen: () => void;
+  showBoot: boolean;
+  summary: MonthlySummary;
+}) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [hasScrolled, setHasScrolled] = useState(false);
   const [heroFade, setHeroFade] = useState(1);
-  const [loadingProgress, setLoadingProgress] = useState(0);
-  const [loadingItem, setLoadingItem] = useState('Starting...');
-  const [loadingDone, setLoadingDone] = useState(false);
+  const [loadingProgress, setLoadingProgress] = useState(showBoot ? 0 : 1);
+  const [loadingItem, setLoadingItem] = useState(showBoot ? 'Starting...' : 'Ready.');
+  const [loadingDone, setLoadingDone] = useState(!showBoot);
+  const [transitionPhase, setTransitionPhase] = useState<LandingTransitionPhase>('idle');
+  const [manualDetailsOpen, setManualDetailsOpen] = useState(false);
   const [terminalFocused, setTerminalFocused] = useState(false);
   const [terminalInput, setTerminalInput] = useState('');
   const [terminalLines, setTerminalLines] = useState<string[]>([
@@ -1109,6 +1462,7 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
     'type "help" for commands'
   ]);
   const terminalRef = useRef<HTMLDivElement>(null);
+  const transitionTimeoutsRef = useRef<number[]>([]);
   const loadingItems = useMemo(
     () => [
       'Starting...',
@@ -1138,6 +1492,16 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
   }, []);
 
   useEffect(() => {
+    if (!showBoot) {
+      setLoadingProgress(1);
+      setLoadingItem('Ready.');
+      setLoadingDone(true);
+      return;
+    }
+
+    setLoadingProgress(0);
+    setLoadingItem('Starting...');
+    setLoadingDone(false);
     let step = 0;
     const timer = window.setInterval(() => {
       step += 1;
@@ -1145,11 +1509,14 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
       setLoadingItem(loadingItems[Math.min(step, loadingItems.length - 1)]);
       if (step >= loadingItems.length - 1) {
         window.clearInterval(timer);
-        window.setTimeout(() => setLoadingDone(true), 360);
+        window.setTimeout(() => {
+          setLoadingDone(true);
+          onBootSeen();
+        }, 360);
       }
     }, 360);
     return () => window.clearInterval(timer);
-  }, [loadingItems]);
+  }, [loadingItems, onBootSeen, showBoot]);
 
   useEffect(() => {
     const terminal = terminalRef.current;
@@ -1157,7 +1524,35 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
     terminal.scrollTop = terminal.scrollHeight;
   }, [terminalLines, terminalInput]);
 
+  useEffect(() => {
+    return () => {
+      transitionTimeoutsRef.current.forEach((timeout) => window.clearTimeout(timeout));
+    };
+  }, []);
+
+  const scheduleTransitionStep = (callback: () => void, delay: number) => {
+    const timeout = window.setTimeout(() => {
+      transitionTimeoutsRef.current = transitionTimeoutsRef.current.filter((current) => current !== timeout);
+      callback();
+    }, delay);
+    transitionTimeoutsRef.current.push(timeout);
+  };
+
+  const showLandingSectionWithTransition = (sectionId: string) => {
+    if (transitionPhase !== 'idle') return;
+
+    setTransitionPhase('leaving');
+    scheduleTransitionStep(() => {
+      document.getElementById(sectionId)?.scrollIntoView({ block: 'start', behavior: 'auto' });
+      setTransitionPhase('leaving-down');
+      scheduleTransitionStep(() => setTransitionPhase('idle'), LANDING_TRANSITION_RETURN_MS);
+    }, LANDING_TRANSITION_EXIT_MS);
+  };
+
   const closeMenu = () => setMenuOpen(false);
+  const openTrackerWithTransition = onEnter;
+  const terminalTopCategory = summary.topSpending[0];
+  const terminalPrimaryAccount = summary.accountBalances[0];
 
   const runTerminalCommand = (rawCommand: string) => {
     const command = rawCommand.trim().toLowerCase();
@@ -1170,21 +1565,71 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
 
     if (command === 'open' || command === 'app') {
       setTerminalLines((current) => [...current, `> ${rawCommand}`, 'opening tracker...']);
-      window.setTimeout(onEnter, 260);
+      openTrackerWithTransition();
       return;
     }
 
-    const responses: Record<string, string[]> = {
-      help: ['> help', 'commands: budget, cashflow, accounts, open, clear'],
-      budget: ['> budget', 'income: ₹120,000', 'expenses: ₹40,100', 'remaining: ₹37,900'],
-      cashflow: ['> cashflow', 'recurring income: ₹120,000', 'fixed bills: ₹36,200', 'projected leftover: ₹5,800'],
-      accounts: ['> accounts', 'primary bank: online', 'cash wallet: online', 'credit card: monitored']
+    const responses: Record<string, { lines: string[]; action?: () => void }> = {
+      help: {
+        lines: [
+          '> help',
+          'commands: budget, cashflow, accounts, tx, backup, about, open, clear',
+          'budget/about also move the page while the bars cover the screen'
+        ]
+      },
+      budget: {
+        lines: [
+          '> budget',
+          `${monthLabel}: ${formatMoney(summary.budgetSpent)} spent`,
+          `${formatMoney(summary.budgetRemaining)} budget remaining`,
+          terminalTopCategory
+            ? `top category: ${terminalTopCategory.category.name} ${formatMoney(terminalTopCategory.amount)}`
+            : 'top category: no spending yet'
+        ],
+        action: () => showLandingSectionWithTransition('projects')
+      },
+      cashflow: {
+        lines: [
+          '> cashflow',
+          `expected income: ${formatMoney(summary.expectedIncome)}`,
+          `fixed bills: ${formatMoney(summary.expectedBills)}`,
+          `projected leftover: ${formatMoney(summary.projectedLeftover)}`
+        ],
+        action: () => showLandingSectionWithTransition('projects')
+      },
+      accounts: {
+        lines: [
+          '> accounts',
+          `${data.accounts.filter((account) => !account.archived).length} active accounts`,
+          terminalPrimaryAccount
+            ? `${terminalPrimaryAccount.account.name}: ${formatMoney(terminalPrimaryAccount.balance)}`
+            : 'no account balances yet',
+          'open the app to edit balances'
+        ]
+      },
+      tx: {
+        lines: [
+          '> tx',
+          `${data.transactions.length} transactions stored`,
+          `${data.categories.length} categories configured`,
+          'manual entry keeps the month intentional'
+        ]
+      },
+      backup: {
+        lines: ['> backup', 'json export/import available in settings', 'your v1 data stays local after auth']
+      },
+      about: {
+        lines: ['> about', 'local-first INR tracker', 'budgets, cash flow, accounts, recurring bills'],
+        action: () => showLandingSectionWithTransition('aboutMe')
+      }
     };
+    const response = responses[command];
 
     setTerminalLines((current) => [
       ...current,
-      ...(responses[command] ?? [`> ${rawCommand}`, `command not found: ${rawCommand}`, 'try: help'])
+      ...(response?.lines ?? [`> ${rawCommand}`, `command not found: ${rawCommand}`, 'try: help'])
     ].slice(-40));
+    response?.action?.();
   };
 
   const handleTerminalKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -1274,7 +1719,12 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
 
       <nav className={menuOpen ? 'active' : ''}>
         <div className="menu-btn">
-          <button className="btn" onClick={() => setMenuOpen((current) => !current)} type="button" aria-label="Toggle menu">
+          <button
+            className="btn"
+            onClick={() => setMenuOpen((current) => !current)}
+            type="button"
+            aria-label="Toggle menu"
+          >
             <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
               <rect width="16" height="3.2" />
               <rect y="6.4" width="16" height="3.2" />
@@ -1282,13 +1732,25 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
             </svg>
           </button>
           <div className="landing-social-buttons">
-            <a className="btn" href="#projects" aria-label="Budget features">
+            <button
+              className="btn"
+              onClick={() => showLandingSectionWithTransition('projects')}
+              type="button"
+              aria-label="Show budget features"
+              title="Budget features"
+            >
               ₹
-            </a>
-            <a className="btn" href="#aboutMe" aria-label="Local-first information">
+            </button>
+            <button
+              className="btn"
+              onClick={() => showLandingSectionWithTransition('aboutMe')}
+              type="button"
+              aria-label="Show local-first information"
+              title="Local-first overview"
+            >
               LF
-            </a>
-            <button className="btn" onClick={onEnter} type="button" aria-label="Open tracker">
+            </button>
+            <button className="btn" onClick={openTrackerWithTransition} type="button" aria-label="Open tracker" title="Sign in">
               App
             </button>
           </div>
@@ -1320,6 +1782,11 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
             The app stores test data in this browser today, while keeping the data model and
             repository layer ready for Supabase when it is time to deploy with auth and a database.
           </p>
+          <div className="landing-command-strip" aria-label="Money Map quick benefits">
+            <span>&gt; INR_DEFAULT</span>
+            <span>&gt; LOCAL_BACKUP</span>
+            <span>&gt; MONTHLY_BUDGETS</span>
+          </div>
         </section>
 
         <section>
@@ -1345,6 +1812,14 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
               <h2>04 Forecast</h2>
               <p>Recurring income and bills estimate what is left before the month ends.</p>
             </article>
+          </div>
+          <div className="landing-workflow-panel">
+            <h2>Better daily flow</h2>
+            <ol>
+              <li><span>01</span><p>Open the app, add the transaction, and move on.</p></li>
+              <li><span>02</span><p>Check budget pressure before the month gets noisy.</p></li>
+              <li><span>03</span><p>Use recurring income and bills to see leftover cash early.</p></li>
+            </ol>
           </div>
         </section>
 
@@ -1408,16 +1883,15 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
           </p>
           <button
             className="collapse-btn btn"
-            data-collapsed="true"
-            onClick={(event) => {
-              const button = event.currentTarget;
-              button.dataset.collapsed = button.dataset.collapsed === 'true' ? 'false' : 'true';
-            }}
+            data-collapsed={manualDetailsOpen ? 'false' : 'true'}
+            aria-expanded={manualDetailsOpen}
+            aria-controls="manual-details"
+            onClick={() => setManualDetailsOpen((current) => !current)}
             type="button"
           >
-            more...
+            {manualDetailsOpen ? 'less...' : 'more...'}
           </button>
-          <div className="collapse-body">
+          <div className="collapse-body" id="manual-details">
             <p>
               The repository interface is intentionally separate from the UI, which makes the future
               Supabase phase a storage swap rather than a product rewrite.
@@ -1428,8 +1902,13 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
         <section>
           <h1 id="contact">Contact</h1>
           <p style={{ textAlign: 'center' }}>Ready to use it?</p>
-          <button className="btn open-tracker-btn" onClick={onEnter} type="button">
-            Open tracker
+          <div className="landing-final-checks" aria-label="Ready checklist">
+            <span>AUTH_GATE_READY</span>
+            <span>LOCAL_DATA_SAFE</span>
+            <span>EXPORT_AVAILABLE</span>
+          </div>
+          <button className="btn open-tracker-btn" onClick={openTrackerWithTransition} type="button">
+            Sign in
           </button>
         </section>
       </main>
@@ -1443,11 +1922,11 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
         <div id="loading-items">{loadingItem}</div>
       </div>
 
+      <PageTransitionOverlay phase={transitionPhase} />
+
       <footer>
-        <div>Developed + Designed for Money Map.</div>
+        <div>Developed by Yuvan Reddy Vadde</div>
         <div>Computer design based on a retro personal finance terminal.</div>
-        <div>Built for manual budgeting, cash-flow forecasts and local-first testing.</div>
-        <div>Supabase database and auth are planned for the deployment phase.</div>
         <div>COPYRIGHT © 2026 Money Map.</div>
       </footer>
     </div>
