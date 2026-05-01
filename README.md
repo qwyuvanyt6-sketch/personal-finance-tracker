@@ -297,6 +297,6 @@ For questions or feedback, please open an issue on GitHub.
 
 <div align="center">
 
-**Built with ❤️ for personal finance management**
+**Built with ❤️ By Vadde Yuvan Reddy**
 
 </div>
