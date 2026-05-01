@@ -17,12 +17,17 @@ export class SupabaseFinanceRepository implements FinanceRepository {
       throw new Error('Supabase client not configured');
     }
 
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) {
+      throw new Error('User not authenticated');
+    }
+
     const [accountsRes, categoriesRes, transactionsRes, budgetsRes, recurringRes] = await Promise.all([
-      supabase.from('accounts').select('*').eq('archived', false),
-      supabase.from('categories').select('*').eq('archived', false),
-      supabase.from('transactions').select('*'),
-      supabase.from('budgets').select('*'),
-      supabase.from('recurring_items').select('*').eq('active', true),
+      supabase.from('accounts').select('*').eq('user_id', user.id),
+      supabase.from('categories').select('*').eq('user_id', user.id),
+      supabase.from('transactions').select('*').eq('user_id', user.id),
+      supabase.from('budgets').select('*').eq('user_id', user.id),
+      supabase.from('recurring_items').select('*').eq('user_id', user.id),
     ]);
 
     if (accountsRes.error) throw accountsRes.error;
@@ -59,6 +64,10 @@ export class SupabaseFinanceRepository implements FinanceRepository {
     }
 
     const userId = user.id;
+
+    await this.deleteMissingRecords(userId, 'transactions', data.transactions.map((transaction) => transaction.id));
+    await this.deleteMissingRecords(userId, 'budgets', data.budgets.map((budget) => budget.id));
+    await this.deleteMissingRecords(userId, 'recurring_items', data.recurringItems.map((item) => item.id));
 
     // Sync accounts
     for (const account of data.accounts) {
@@ -134,10 +143,39 @@ export class SupabaseFinanceRepository implements FinanceRepository {
         updated_at: item.updatedAt,
       }, { onConflict: 'id' });
     }
+
+    await this.deleteMissingRecords(userId, 'categories', data.categories.map((category) => category.id));
+    await this.deleteMissingRecords(userId, 'accounts', data.accounts.map((account) => account.id));
   }
 
   async migrateFromLocal(localData: FinanceData): Promise<void> {
     await this.syncAll(localData);
+  }
+
+  private async deleteMissingRecords(userId: string, table: string, keepIds: string[]): Promise<void> {
+    if (!supabase) {
+      throw new Error('Supabase client not configured');
+    }
+
+    const { data: currentRows, error: selectError } = await supabase
+      .from(table)
+      .select('id')
+      .eq('user_id', userId);
+    if (selectError) throw selectError;
+
+    const keep = new Set(keepIds);
+    const staleIds = (currentRows ?? [])
+      .map((row: { id: string }) => row.id)
+      .filter((id: string) => !keep.has(id));
+
+    if (!staleIds.length) return;
+
+    const { error: deleteError } = await supabase
+      .from(table)
+      .delete()
+      .eq('user_id', userId)
+      .in('id', staleIds);
+    if (deleteError) throw deleteError;
   }
 }
 

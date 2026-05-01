@@ -9,6 +9,7 @@ import {
   Download,
   LayoutDashboard,
   ListPlus,
+  LogOut,
   PiggyBank,
   Plus,
   ReceiptText,
@@ -49,6 +50,7 @@ let supabaseRepository: SupabaseFinanceRepository | null = null;
 const LANDING_TRANSITION_EXIT_MS = 1150;
 const LANDING_TRANSITION_RETURN_MS = 1150;
 const REMEMBER_AUTH_KEY = 'money-map:remember-session';
+const LOCAL_STORAGE_DATA_KEY = 'money-map.finance-data.v1';
 
 const navItems: Array<{ key: ViewKey; label: string; icon: typeof LayoutDashboard }> = [
   { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
@@ -128,6 +130,227 @@ const getMonthDateRange = (monthKey: string) => {
   return `${formatRangeDate(start)} TO ${formatRangeDate(end)}`;
 };
 
+const hasFinanceRecords = (financeData: FinanceData) =>
+  financeData.accounts.length > 0 ||
+  financeData.categories.length > 0 ||
+  financeData.transactions.length > 0 ||
+  financeData.budgets.length > 0 ||
+  financeData.recurringItems.length > 0;
+
+const readInitialFinanceData = (): FinanceData => {
+  try {
+    const raw = window.localStorage.getItem(LOCAL_STORAGE_DATA_KEY);
+    if (!raw) return createSeedData();
+    const parsed = JSON.parse(raw) as FinanceData;
+    if (parsed.version !== 1 || !Array.isArray(parsed.transactions)) return createSeedData();
+    return parsed;
+  } catch {
+    return createSeedData();
+  }
+};
+
+const downloadFile = (contents: string, fileName: string, type: string) => {
+  const blob = new Blob([contents], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(url);
+};
+
+const normalizeKey = (value: string) => value.trim().toLowerCase();
+
+const csvCell = (value: string | number | undefined) => {
+  const text = String(value ?? '');
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+};
+
+const parseCsv = (text: string): string[][] => {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = '';
+  let quoted = false;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    const next = text[index + 1];
+
+    if (quoted) {
+      if (char === '"' && next === '"') {
+        cell += '"';
+        index += 1;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        cell += char;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      quoted = true;
+    } else if (char === ',') {
+      row.push(cell);
+      cell = '';
+    } else if (char === '\n') {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = '';
+    } else if (char !== '\r') {
+      cell += char;
+    }
+  }
+
+  row.push(cell);
+  if (row.some((value) => value.trim())) rows.push(row);
+  return rows;
+};
+
+const readUploadedFile = (file: File) => {
+  if (typeof file.text === 'function') return file.text();
+
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ''));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(file);
+  });
+};
+
+const financeDataToCsv = (financeData: FinanceData) => {
+  const accountsById = new Map(financeData.accounts.map((account) => [account.id, account]));
+  const categoriesById = new Map(financeData.categories.map((category) => [category.id, category]));
+  const headers = [
+    'Record ID',
+    'Date',
+    'Month',
+    'Type',
+    'Amount INR',
+    'Category',
+    'Category Kind',
+    'Account',
+    'Account Type',
+    'Notes',
+    'Created At',
+    'Updated At'
+  ];
+  const rows = financeData.transactions
+    .slice()
+    .sort((a, b) => `${b.date}-${b.createdAt}`.localeCompare(`${a.date}-${a.createdAt}`))
+    .map((transaction) => {
+      const account = accountsById.get(transaction.accountId);
+      const category = categoriesById.get(transaction.categoryId);
+      return [
+        transaction.id,
+        transaction.date,
+        transaction.date.slice(0, 7),
+        transaction.type,
+        transaction.amount,
+        category?.name ?? '',
+        category?.kind ?? transaction.type,
+        account?.name ?? '',
+        account?.type ?? '',
+        transaction.notes,
+        transaction.createdAt,
+        transaction.updatedAt
+      ].map(csvCell).join(',');
+    });
+
+  return [
+    headers.map(csvCell).join(','),
+    ...rows
+  ].join('\n');
+};
+
+const csvToFinanceData = (text: string, current: FinanceData): FinanceData => {
+  const rows = parseCsv(text).filter((row) => row.some((cell) => cell.trim()));
+  if (rows.length < 2) throw new Error('CSV has no transaction rows');
+
+  const headers = rows[0].map((header) => normalizeKey(header));
+  const getValue = (row: string[], names: string[]) => {
+    const index = names.map(normalizeKey).map((name) => headers.indexOf(name)).find((value) => value >= 0);
+    return index === undefined ? '' : row[index]?.trim() ?? '';
+  };
+
+  const now = new Date().toISOString();
+  const accounts = [...current.accounts];
+  const categories = [...current.categories];
+  const transactions = [...current.transactions];
+  const accountByName = new Map(accounts.map((account) => [normalizeKey(account.name), account]));
+  const categoryByNameAndKind = new Map(categories.map((category) => [`${category.kind}:${normalizeKey(category.name)}`, category]));
+
+  rows.slice(1).forEach((row) => {
+    const date = getValue(row, ['Date', 'Transaction Date']);
+    const type = normalizeKey(getValue(row, ['Type'])) === 'income' ? 'income' : 'expense';
+    const amount = Number(getValue(row, ['Amount INR', 'Amount']).replace(/[₹,\s]/g, ''));
+    if (!date || !Number.isFinite(amount) || amount <= 0) return;
+
+    const accountName = getValue(row, ['Account', 'Account Name']) || 'Imported Account';
+    const accountTypeRaw = normalizeKey(getValue(row, ['Account Type']));
+    const accountType: AccountType = accountTypeRaw === 'cash' || accountTypeRaw === 'card' ? accountTypeRaw : 'bank';
+    let account = accountByName.get(normalizeKey(accountName));
+    if (!account) {
+      account = {
+        ...blankAccount(),
+        id: makeId('acct_import'),
+        name: accountName,
+        type: accountType,
+        openingBalance: 0,
+        color: colorOptions[accounts.length % colorOptions.length],
+        createdAt: now,
+        updatedAt: now
+      };
+      accounts.push(account);
+      accountByName.set(normalizeKey(account.name), account);
+    }
+
+    const categoryName = getValue(row, ['Category', 'Category Name']) || (type === 'income' ? 'Imported Income' : 'Imported Expense');
+    const categoryKind = normalizeKey(getValue(row, ['Category Kind'])) === 'income' ? 'income' : type;
+    const categoryKey = `${categoryKind}:${normalizeKey(categoryName)}`;
+    let category = categoryByNameAndKind.get(categoryKey);
+    if (!category) {
+      category = {
+        ...blankCategory(categoryKind as CategoryKind),
+        id: makeId('cat_import'),
+        name: categoryName,
+        color: colorOptions[(categories.length + 2) % colorOptions.length],
+        createdAt: now,
+        updatedAt: now
+      };
+      categories.push(category);
+      categoryByNameAndKind.set(categoryKey, category);
+    }
+
+    const importedId = getValue(row, ['Record ID', 'ID']);
+    const transaction: Transaction = {
+      id: importedId || makeId('txn_import'),
+      date,
+      type,
+      amount,
+      categoryId: category.id,
+      accountId: account.id,
+      notes: getValue(row, ['Notes', 'Description', 'Memo']),
+      createdAt: getValue(row, ['Created At']) || now,
+      updatedAt: new Date().toISOString()
+    };
+    const existingIndex = transactions.findIndex((item) => item.id === transaction.id);
+    if (existingIndex >= 0) {
+      transactions[existingIndex] = transaction;
+    } else {
+      transactions.push(transaction);
+    }
+  });
+
+  return {
+    ...current,
+    accounts,
+    categories,
+    transactions
+  };
+};
+
 const toTerminalLabel = (label: string) => label.toUpperCase().replace(/\s+/g, '_');
 
 const upsertById = <T extends { id: string; updatedAt: string }>(items: T[], item: T) => {
@@ -138,16 +361,17 @@ const upsertById = <T extends { id: string; updatedAt: string }>(items: T[], ite
 };
 
 function App() {
-  const [data, setData] = useState<FinanceData | null>(null);
+  const initialData = useMemo(() => readInitialFinanceData(), []);
+  const [data, setData] = useState<FinanceData | null>(initialData);
   const [screen, setScreen] = useState<AppScreen>('landing');
   const [activeView, setActiveView] = useState<ViewKey>('dashboard');
   const [month, setMonth] = useState(getMonthKey());
   const [monthPickerOpen, setMonthPickerOpen] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
-  const [transactionForm, setTransactionForm] = useState<Transaction | null>(null);
+  const [transactionForm, setTransactionForm] = useState<Transaction | null>(() => blankTransaction(initialData));
   const [accountForm, setAccountForm] = useState<Account>(blankAccount());
   const [categoryForm, setCategoryForm] = useState<Category>(blankCategory('expense'));
-  const [recurringForm, setRecurringForm] = useState<RecurringItem | null>(null);
+  const [recurringForm, setRecurringForm] = useState<RecurringItem | null>(() => blankRecurring(initialData));
   const [toast, setToast] = useState('');
   const [systemTime, setSystemTime] = useState(() => new Date().toLocaleTimeString('en-GB'));
   const [isSupabaseAuthenticated, setIsSupabaseAuthenticated] = useState(false);
@@ -164,15 +388,23 @@ function App() {
       if (supabase) {
         const { data: { session } } = await supabase.auth.getSession();
         if (session) {
-          setIsSupabaseAuthenticated(true);
-          supabaseRepository = new SupabaseFinanceRepository();
+          const cloudRepository = new SupabaseFinanceRepository();
           try {
-            const loaded = await supabaseRepository.load();
+            let loaded = await cloudRepository.load();
+            if (!hasFinanceRecords(loaded)) {
+              const localData = await localRepository.load();
+              await cloudRepository.migrateFromLocal(localData);
+              loaded = await cloudRepository.load();
+            }
+            supabaseRepository = cloudRepository;
             setData(loaded);
             setTransactionForm(blankTransaction(loaded));
             setRecurringForm(blankRecurring(loaded));
+            setIsSupabaseAuthenticated(true);
             return;
           } catch {
+            supabaseRepository = null;
+            setIsSupabaseAuthenticated(false);
             // Fall back to localStorage if Supabase load fails
           }
         }
@@ -209,15 +441,28 @@ function App() {
     return () => window.clearInterval(timer);
   }, []);
 
-  // Update transaction form when accounts or categories change
   useEffect(() => {
-    if (!data) return;
-    // Only update if current form has empty account/category and data has them
-    if ((!transactionForm?.accountId && data.accounts.length > 0) || 
-        (!transactionForm?.categoryId && data.categories.length > 0)) {
-      setTransactionForm(blankTransaction(data));
+    if (!data || !transactionForm) return;
+
+    const activeAccounts = data.accounts.filter((account) => !account.archived);
+    const categoriesForType = data.categories.filter(
+      (category) => !category.archived && category.kind === transactionForm.type
+    );
+    const nextAccountId = activeAccounts.some((account) => account.id === transactionForm.accountId)
+      ? transactionForm.accountId
+      : activeAccounts[0]?.id ?? '';
+    const nextCategoryId = categoriesForType.some((category) => category.id === transactionForm.categoryId)
+      ? transactionForm.categoryId
+      : categoriesForType[0]?.id ?? '';
+
+    if (nextAccountId !== transactionForm.accountId || nextCategoryId !== transactionForm.categoryId) {
+      setTransactionForm({
+        ...transactionForm,
+        accountId: nextAccountId,
+        categoryId: nextCategoryId
+      });
     }
-  }, [data?.accounts.length, data?.categories.length]);
+  }, [data, transactionForm]);
 
   useEffect(() => {
     return () => {
@@ -232,12 +477,7 @@ function App() {
   const markLandingBootSeen = useCallback(() => setLandingBootSeen(true), []);
 
   if (!data || !summary || !transactionForm || !recurringForm) {
-    return (
-      <main className="loading-shell">
-        <CircleDollarSign size={32} />
-        <p>Preparing your tracker...</p>
-      </main>
-    );
+    return <main className="loading-shell" aria-label="Loading Money Map" />;
   }
 
   const scheduleRouteTransitionStep = (callback: () => void, delay: number) => {
@@ -287,24 +527,32 @@ function App() {
     setScreen('tracker');
     window.scrollTo(0, 0);
 
-    // Check if Supabase session exists and sync if needed
-    if (supabase) {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (session && !isSupabaseAuthenticated) {
-        setIsSupabaseAuthenticated(true);
-        supabaseRepository = new SupabaseFinanceRepository();
+    if (!supabase) return;
 
-        // Sync local data to Supabase
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+
+    const cloudRepository = new SupabaseFinanceRepository();
+    try {
+      let cloudData = await cloudRepository.load();
+      if (!hasFinanceRecords(cloudData)) {
         const localData = await localRepository.load();
-        try {
-          await supabaseRepository.migrateFromLocal(localData);
-          const synced = await supabaseRepository.load();
-          setData(synced);
-          setToast('DATA_SYNCED: LOCAL_DATA_MIGRATED_TO_CLOUD');
-        } catch {
-          // Keep local data if sync fails
-        }
+        await cloudRepository.migrateFromLocal(localData);
+        cloudData = await cloudRepository.load();
+        setToast('SIGNED_IN: LOCAL_DATA_SAVED_TO_DATABASE');
+      } else {
+        setToast('SIGNED_IN: DATABASE_DATA_LOADED');
       }
+
+      supabaseRepository = cloudRepository;
+      setData(cloudData);
+      setTransactionForm(blankTransaction(cloudData));
+      setRecurringForm(blankRecurring(cloudData));
+      setIsSupabaseAuthenticated(true);
+    } catch {
+      supabaseRepository = null;
+      setIsSupabaseAuthenticated(false);
+      setToast('DATABASE_LOAD_FAILED: USING_LOCAL_BROWSER_DATA');
     }
   };
 
@@ -343,13 +591,22 @@ function App() {
 
   const saveTransaction = () => {
     const missing = [];
-    if (!transactionForm.accountId) missing.push('account');
-    if (!transactionForm.categoryId) missing.push('category');
+    const activeAccounts = data.accounts.filter((account) => !account.archived);
+    const categoriesForType = data.categories.filter(
+      (category) => !category.archived && category.kind === transactionForm.type
+    );
+
+    if (!activeAccounts.some((account) => account.id === transactionForm.accountId)) missing.push('account');
+    if (!categoriesForType.some((category) => category.id === transactionForm.categoryId)) {
+      missing.push(`${transactionForm.type} category`);
+    }
     if (transactionForm.amount <= 0) missing.push('valid amount');
     
     if (missing.length > 0) {
-      if (data.accounts.length === 0 || data.categories.length === 0) {
-        setToast('Create accounts and categories first in Settings.');
+      if (!activeAccounts.length) {
+        setToast('Add an account in Settings before creating transactions.');
+      } else if (!categoriesForType.length) {
+        setToast(`Add a ${transactionForm.type} category in Settings first.`);
       } else {
         setToast(`Missing: ${missing.join(', ')}`);
       }
@@ -443,28 +700,43 @@ function App() {
     setRecurringForm(blankRecurring(data));
   };
 
-  const exportBackup = () => {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `money-map-backup-${todayIsoDate()}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
-    setToast('Backup exported.');
+  const exportCsv = () => {
+    downloadFile(
+      financeDataToCsv(data),
+      `money-map-ledger-${todayIsoDate()}.csv`,
+      'text/csv;charset=utf-8'
+    );
+    setToast('Professional CSV ledger exported.');
   };
 
-  const importBackup = async (file: File) => {
+  const exportJsonBackup = () => {
+    downloadFile(
+      JSON.stringify(data, null, 2),
+      `money-map-complete-backup-${todayIsoDate()}.json`,
+      'application/json'
+    );
+    setToast('Complete JSON backup exported.');
+  };
+
+  const importDataFile = async (file: File) => {
     try {
-      const imported = JSON.parse(await file.text()) as FinanceData;
-      if (imported.version !== 1 || !Array.isArray(imported.transactions)) {
-        throw new Error('Invalid backup');
+      const contents = await readUploadedFile(file);
+      const isCsv = file.name.toLowerCase().endsWith('.csv') || file.type.includes('csv');
+      if (isCsv) {
+        const imported = csvToFinanceData(contents, data);
+        updateData(() => imported, 'CSV imported and merged.');
+        setTransactionForm(blankTransaction(imported));
+        setRecurringForm(blankRecurring(imported));
+        return;
       }
+
+      const imported = JSON.parse(contents) as FinanceData;
+      if (imported.version !== 1 || !Array.isArray(imported.transactions)) throw new Error('Invalid backup');
       updateData(() => imported, 'Backup imported.');
       setTransactionForm(blankTransaction(imported));
       setRecurringForm(blankRecurring(imported));
     } catch {
-      setToast('That backup file could not be imported.');
+      setToast('That file could not be imported. Use Money Map CSV or JSON.');
     }
   };
 
@@ -475,15 +747,34 @@ function App() {
     setRecurringForm(blankRecurring(seed));
   };
 
+  const signOutOfDatabase = async () => {
+    if (supabase) {
+      await supabase.auth.signOut();
+    }
+    supabaseRepository = null;
+    setIsSupabaseAuthenticated(false);
+    window.localStorage.removeItem(REMEMBER_AUTH_KEY);
+    setRememberedSession(false);
+    setToast('SIGNED_OUT: DATABASE_SESSION_CLOSED');
+  };
+
   const monthTransactions = data.transactions
     .filter((transaction) => transaction.date.startsWith(month))
     .sort((a, b) => b.date.localeCompare(a.date));
+  const activeAccounts = data.accounts.filter((account) => !account.archived);
   const expenseCategories = data.categories.filter((category) => category.kind === 'expense' && !category.archived);
   const incomeCategories = data.categories.filter((category) => category.kind === 'income' && !category.archived);
-  const formCategories =
-    transactionForm.type === 'income' ? incomeCategories : expenseCategories.length ? expenseCategories : data.categories;
+  const formCategories = transactionForm.type === 'income' ? incomeCategories : expenseCategories;
   const recurringCategories =
     recurringForm.kind === 'income' ? incomeCategories : expenseCategories.length ? expenseCategories : data.categories;
+  const transactionSetupIssues = [
+    ...(!activeAccounts.length ? ['Add at least one account in Settings.'] : []),
+    ...(!formCategories.length ? [`Add at least one ${transactionForm.type} category in Settings.`] : [])
+  ];
+  const transactionFormIssues = [
+    ...transactionSetupIssues,
+    ...(transactionForm.amount <= 0 ? ['Enter an amount greater than zero.'] : [])
+  ];
   const dashboardTopSpend = summary.topSpending.slice(0, 4);
   const maxTopSpend = Math.max(...dashboardTopSpend.map((item) => item.amount), 1);
   const recentTransactions = monthTransactions.slice(0, 5);
@@ -709,7 +1000,10 @@ function App() {
                     value={transactionForm.accountId}
                     onChange={(event) => setTransactionForm({ ...transactionForm, accountId: event.target.value })}
                   >
-                    {data.accounts.map((account) => (
+                    <option value="" disabled>
+                      {activeAccounts.length ? 'Select account' : 'Add account in Settings'}
+                    </option>
+                    {activeAccounts.map((account) => (
                       <option key={account.id} value={account.id}>{account.name}</option>
                     ))}
                   </select>
@@ -720,6 +1014,9 @@ function App() {
                     value={transactionForm.categoryId}
                     onChange={(event) => setTransactionForm({ ...transactionForm, categoryId: event.target.value })}
                   >
+                    <option value="" disabled>
+                      {formCategories.length ? 'Select category' : `Add ${transactionForm.type} category in Settings`}
+                    </option>
                     {formCategories.map((category) => (
                       <option key={category.id} value={category.id}>{category.name}</option>
                     ))}
@@ -733,11 +1030,27 @@ function App() {
                     placeholder="Optional"
                   />
                 </label>
+                <div className={`form-alert full-span ${transactionFormIssues.length ? 'warning' : 'ready'}`} role="status">
+                  <strong>{transactionFormIssues.length ? 'Before adding' : 'Ready to add'}</strong>
+                  <span>
+                    {transactionFormIssues.length
+                      ? transactionFormIssues.join(' ')
+                      : `${transactionForm.type === 'income' ? 'Income' : 'Expense'} will be saved to ${
+                          activeAccounts.find((account) => account.id === transactionForm.accountId)?.name ?? 'the selected account'
+                        }.`}
+                  </span>
+                </div>
                 <div className="button-row full-span">
                   <button className="primary-button" onClick={saveTransaction} type="button">
                     <Save size={17} />
                     <span>{editingTransaction ? 'Update' : 'Add'} transaction</span>
                   </button>
+                  {transactionSetupIssues.length > 0 && (
+                    <button className="secondary-button" onClick={() => setActiveView('settings')} type="button">
+                      <Settings size={17} />
+                      <span>Open settings</span>
+                    </button>
+                  )}
                   {editingTransaction && (
                     <button
                       className="secondary-button"
@@ -1048,32 +1361,48 @@ function App() {
             </section>
             <section className="panel form-panel">
               <div className="panel-heading">
-                <h2>Backup</h2>
-                <span>Local browser storage</span>
+                <h2>Data Port</h2>
+                <span>{isSupabaseAuthenticated ? 'Database sync active' : 'Local browser storage'}</span>
               </div>
-              <p className="muted-copy">Your data stays in this browser. Export a JSON backup before clearing browser data or moving devices.</p>
+              <p className="muted-copy">
+                Export a clean Money Map ledger CSV for spreadsheets, or keep a complete JSON backup for full app restore.
+              </p>
               <div className="button-stack">
-                <button className="primary-button" onClick={exportBackup} type="button">
+                <button className="primary-button" onClick={exportCsv} type="button">
                   <Download size={17} />
-                  <span>Export backup</span>
+                  <span>Export ledger CSV</span>
                 </button>
                 <button className="secondary-button" onClick={() => fileInputRef.current?.click()} type="button">
                   <Upload size={17} />
-                  <span>Import backup</span>
+                  <span>Import CSV / JSON</span>
                 </button>
-                <button className="secondary-button" onClick={resetDemoData} type="button">
-                  <RefreshCcw size={17} />
-                  <span>Restore demo data</span>
+                <button className="secondary-button" onClick={exportJsonBackup} type="button">
+                  <Download size={17} />
+                  <span>Export full JSON</span>
                 </button>
+                <div className="data-port-note">
+                  <strong>CSV columns</strong>
+                  <span>Record ID, Date, Month, Type, Amount INR, Category, Account and Notes.</span>
+                </div>
               </div>
+              <button className="secondary-button data-reset-button" onClick={resetDemoData} type="button">
+                <RefreshCcw size={17} />
+                <span>Restore demo data</span>
+              </button>
+              {isSupabaseAuthenticated && (
+                <button className="secondary-button data-reset-button" onClick={signOutOfDatabase} type="button">
+                  <LogOut size={17} />
+                  <span>Sign out database</span>
+                </button>
+              )}
               <input
                 ref={fileInputRef}
                 className="hidden-input"
                 type="file"
-                accept="application/json"
+                accept=".csv,text/csv,application/json,.json"
                 onChange={(event) => {
                   const file = event.target.files?.[0];
-                  if (file) void importBackup(file);
+                  if (file) void importDataFile(file);
                   event.currentTarget.value = '';
                 }}
               />
@@ -1229,7 +1558,7 @@ function LegacyLandingPage({ onEnter }: { onEnter: () => void }) {
               <li>Supabase-ready</li>
             </ul>
             <p>
-              Your test data stays in this browser and can be exported as a JSON backup. The repository layer
+              Your test data stays in this browser and can be exported as CSV or a full JSON backup. The repository layer
               keeps the app ready for a future cloud database without changing the product flow.
             </p>
           </article>
@@ -1616,7 +1945,7 @@ function LandingPage({
         ]
       },
       backup: {
-        lines: ['> backup', 'json export/import available in settings', 'your v1 data stays local after auth']
+        lines: ['> backup', 'ledger csv + full json available in settings', 'authenticated sessions sync to database']
       },
       about: {
         lines: ['> about', 'local-first INR tracker', 'budgets, cash flow, accounts, recurring bills'],
@@ -1776,7 +2105,7 @@ function LandingPage({
           </p>
           <p>
             The first version focuses on manual entry, INR formatting, recurring income, recurring
-            bills, category budgets and JSON backup export/import.
+            bills, category budgets and CSV/JSON export/import.
           </p>
           <p>
             The app stores test data in this browser today, while keeping the data model and
@@ -1879,7 +2208,7 @@ function LandingPage({
           </ul>
           <p>
             Add income and expenses by hand, assign them to accounts and categories, then export
-            or import a JSON backup whenever you need to move data.
+            a polished CSV ledger or import records whenever you need to move data.
           </p>
           <button
             className="collapse-btn btn"
@@ -1913,7 +2242,6 @@ function LandingPage({
         </section>
       </main>
 
-      <input type="text" id="textarea" readOnly />
       <div id="loading" className={loadingDone ? 'loaded' : ''}>
         <h2>Booting...</h2>
         <div id="loading-bar">

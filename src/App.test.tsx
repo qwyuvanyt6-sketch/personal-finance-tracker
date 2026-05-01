@@ -1,7 +1,9 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it } from 'vitest';
 import App from './App';
+import { createSeedData } from './data/seedData';
+import { todayIsoDate } from './domain/dates';
 
 describe('App', () => {
   beforeEach(() => {
@@ -88,5 +90,51 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: /add transaction/i }));
 
     await waitFor(() => expect(screen.getByText(/Tea and snacks/i)).toBeInTheDocument());
+  });
+
+  it('explains missing setup before adding a transaction', async () => {
+    const user = userEvent.setup();
+    const emptySetup = {
+      ...createSeedData(),
+      accounts: [],
+      categories: [],
+      transactions: [],
+      budgets: [],
+      recurringItems: []
+    };
+    window.localStorage.setItem('money-map.finance-data.v1', JSON.stringify(emptySetup));
+    render(<App />);
+
+    await openAuthenticatedTracker(user);
+    await user.click(await screen.findByRole('button', { name: /transactions/i }));
+
+    expect(screen.getByText(/add at least one account in settings/i)).toBeInTheDocument();
+    expect(screen.getByText(/add at least one expense category in settings/i)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /add transaction/i }));
+    expect(await screen.findByText(/add an account in settings/i)).toBeInTheDocument();
+  });
+
+  it('imports transactions from Money Map CSV', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    await openAuthenticatedTracker(user);
+    await user.click(await screen.findByRole('button', { name: /settings/i }));
+
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    const importDate = todayIsoDate();
+    const csv = [
+      'Record ID,Date,Month,Type,Amount INR,Category,Category Kind,Account,Account Type,Notes,Created At,Updated At',
+      `txn_csv_test,${importDate},${importDate.slice(0, 7)},expense,999,Books,expense,Imported Bank,bank,CSV book purchase,,`
+    ].join('\n');
+    fireEvent.change(fileInput, {
+      target: {
+        files: [new File([csv], 'money-map-ledger.csv', { type: 'text/csv' })]
+      }
+    });
+
+    expect(await screen.findByText(/csv imported and merged/i)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /transactions/i }));
+    expect(await screen.findByText(/CSV book purchase/i)).toBeInTheDocument();
   });
 });
