@@ -375,6 +375,7 @@ function App() {
   const [toast, setToast] = useState('');
   const [systemTime, setSystemTime] = useState(() => new Date().toLocaleTimeString('en-GB'));
   const [isSupabaseAuthenticated, setIsSupabaseAuthenticated] = useState(false);
+  const [currentUserEmail, setCurrentUserEmail] = useState('');
   const [rememberedSession, setRememberedSession] = useState(() => window.localStorage.getItem(REMEMBER_AUTH_KEY) === 'true');
   const [routeTransitionPhase, setRouteTransitionPhase] = useState<LandingTransitionPhase>('idle');
   const [landingBootSeen, setLandingBootSeen] = useState(false);
@@ -401,10 +402,12 @@ function App() {
             setTransactionForm(blankTransaction(loaded));
             setRecurringForm(blankRecurring(loaded));
             setIsSupabaseAuthenticated(true);
+            setCurrentUserEmail(session.user.email ?? '');
             return;
           } catch {
             supabaseRepository = null;
             setIsSupabaseAuthenticated(false);
+            setCurrentUserEmail('');
             // Fall back to localStorage if Supabase load fails
           }
         }
@@ -423,7 +426,7 @@ function App() {
     if (!data) return;
     if (isSupabaseAuthenticated && supabaseRepository) {
       supabaseRepository.save(data).catch(() => {
-        // Silently fail - data stays in memory
+        setToast('DATABASE_SAVE_FAILED: LOCAL_COPY_STILL_ACTIVE');
       });
     } else {
       localRepository.save(data);
@@ -510,7 +513,7 @@ function App() {
     transitionToScreen(shouldResumeSession ? 'tracker' : 'auth');
   };
 
-  const goToTracker = async (rememberSession = false) => {
+  const goToTracker = async (rememberSession = false, authenticatedEmail = '') => {
     routeTransitionTimeoutsRef.current.forEach((timeout) => window.clearTimeout(timeout));
     routeTransitionTimeoutsRef.current = [];
     setRouteTransitionPhase('idle');
@@ -518,7 +521,6 @@ function App() {
     if (rememberSession) {
       window.localStorage.setItem(REMEMBER_AUTH_KEY, 'true');
       setRememberedSession(true);
-      setIsSupabaseAuthenticated(true);
     } else {
       window.localStorage.removeItem(REMEMBER_AUTH_KEY);
       setRememberedSession(false);
@@ -526,6 +528,7 @@ function App() {
 
     setScreen('tracker');
     window.scrollTo(0, 0);
+    if (authenticatedEmail) setCurrentUserEmail(authenticatedEmail);
 
     if (!supabase) return;
 
@@ -549,9 +552,11 @@ function App() {
       setTransactionForm(blankTransaction(cloudData));
       setRecurringForm(blankRecurring(cloudData));
       setIsSupabaseAuthenticated(true);
+      setCurrentUserEmail(session.user.email ?? '');
     } catch {
       supabaseRepository = null;
       setIsSupabaseAuthenticated(false);
+      setCurrentUserEmail('');
       setToast('DATABASE_LOAD_FAILED: USING_LOCAL_BROWSER_DATA');
     }
   };
@@ -753,9 +758,12 @@ function App() {
     }
     supabaseRepository = null;
     setIsSupabaseAuthenticated(false);
+    setCurrentUserEmail('');
     window.localStorage.removeItem(REMEMBER_AUTH_KEY);
     setRememberedSession(false);
     setToast('SIGNED_OUT: DATABASE_SESSION_CLOSED');
+    setScreen('auth');
+    window.scrollTo(0, 0);
   };
 
   const monthTransactions = data.transactions
@@ -778,6 +786,7 @@ function App() {
   const dashboardTopSpend = summary.topSpending.slice(0, 4);
   const maxTopSpend = Math.max(...dashboardTopSpend.map((item) => item.amount), 1);
   const recentTransactions = monthTransactions.slice(0, 5);
+  const sidebarUsername = currentUserEmail ? currentUserEmail.split('@')[0].toUpperCase() : 'LOCAL_GUEST';
 
   return (
     <>
@@ -823,9 +832,15 @@ function App() {
             </div>
             <div>
               <dt>USER:</dt>
-              <dd>LOCAL_GUEST</dd>
+              <dd>{sidebarUsername}</dd>
             </div>
           </dl>
+          {currentUserEmail && (
+            <button className="logout-button" onClick={signOutOfDatabase} type="button">
+              <LogOut size={15} />
+              <span>LOGOUT</span>
+            </button>
+          )}
         </div>
       </aside>
 
@@ -1008,7 +1023,7 @@ function App() {
                     ))}
                   </select>
                 </label>
-                <label>
+                <label className="full-span">
                   <span>Category</span>
                   <select
                     value={transactionForm.categoryId}
@@ -1292,7 +1307,7 @@ function App() {
                     onChange={(event) => setAccountForm({ ...accountForm, openingBalance: Number(event.target.value) })}
                   />
                 </label>
-                <label>
+                <label className="full-span">
                   <span>Color</span>
                   <ColorPicker value={accountForm.color} onChange={(color) => setAccountForm({ ...accountForm, color })} />
                 </label>
@@ -1595,7 +1610,7 @@ function PageTransitionOverlay({ phase }: { phase: LandingTransitionPhase }) {
   );
 }
 
-function AuthPage({ onAuthenticated, onBack }: { onAuthenticated: (rememberSession?: boolean) => void; onBack: () => void }) {
+function AuthPage({ onAuthenticated, onBack }: { onAuthenticated: (rememberSession?: boolean, email?: string) => void; onBack: () => void }) {
   const [email, setEmail] = useState('');
   const [accessToken, setAccessToken] = useState('');
   const [persistSession, setPersistSession] = useState(false);
@@ -1620,7 +1635,7 @@ function AuthPage({ onAuthenticated, onBack }: { onAuthenticated: (rememberSessi
     if (allowTestBypass) {
       setAuthState('success');
       setAuthMessage('TEST_SESSION_GRANTED');
-      onAuthenticated(persistSession);
+      onAuthenticated(persistSession, trimmedEmail);
       return;
     }
 
@@ -1646,7 +1661,7 @@ function AuthPage({ onAuthenticated, onBack }: { onAuthenticated: (rememberSessi
       if (response.data.session) {
         setAuthState('success');
         setAuthMessage(persistSession ? 'ACCESS_GRANTED: SESSION_PERSISTED' : 'ACCESS_GRANTED: SESSION_ACTIVE');
-        window.setTimeout(() => onAuthenticated(persistSession), 260);
+        window.setTimeout(() => onAuthenticated(persistSession, trimmedEmail), 260);
         return;
       }
 

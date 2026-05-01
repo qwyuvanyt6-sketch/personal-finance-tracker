@@ -64,13 +64,14 @@ export class SupabaseFinanceRepository implements FinanceRepository {
     }
 
     const userId = user.id;
+    const scopedData = scopeFinanceDataToUser(data, userId);
 
-    await this.deleteMissingRecords(userId, 'transactions', data.transactions.map((transaction) => transaction.id));
-    await this.deleteMissingRecords(userId, 'budgets', data.budgets.map((budget) => budget.id));
-    await this.deleteMissingRecords(userId, 'recurring_items', data.recurringItems.map((item) => item.id));
+    await this.deleteMissingRecords(userId, 'transactions', scopedData.transactions.map((transaction) => transaction.id));
+    await this.deleteMissingRecords(userId, 'budgets', scopedData.budgets.map((budget) => budget.id));
+    await this.deleteMissingRecords(userId, 'recurring_items', scopedData.recurringItems.map((item) => item.id));
 
     // Sync accounts
-    for (const account of data.accounts) {
+    for (const account of scopedData.accounts) {
       await supabase.from('accounts').upsert({
         id: account.id,
         user_id: userId,
@@ -85,7 +86,7 @@ export class SupabaseFinanceRepository implements FinanceRepository {
     }
 
     // Sync categories
-    for (const category of data.categories) {
+    for (const category of scopedData.categories) {
       await supabase.from('categories').upsert({
         id: category.id,
         user_id: userId,
@@ -99,7 +100,7 @@ export class SupabaseFinanceRepository implements FinanceRepository {
     }
 
     // Sync transactions
-    for (const transaction of data.transactions) {
+    for (const transaction of scopedData.transactions) {
       await supabase.from('transactions').upsert({
         id: transaction.id,
         user_id: userId,
@@ -115,7 +116,7 @@ export class SupabaseFinanceRepository implements FinanceRepository {
     }
 
     // Sync budgets
-    for (const budget of data.budgets) {
+    for (const budget of scopedData.budgets) {
       await supabase.from('budgets').upsert({
         id: budget.id,
         user_id: userId,
@@ -128,7 +129,7 @@ export class SupabaseFinanceRepository implements FinanceRepository {
     }
 
     // Sync recurring items
-    for (const item of data.recurringItems) {
+    for (const item of scopedData.recurringItems) {
       await supabase.from('recurring_items').upsert({
         id: item.id,
         user_id: userId,
@@ -144,8 +145,8 @@ export class SupabaseFinanceRepository implements FinanceRepository {
       }, { onConflict: 'id' });
     }
 
-    await this.deleteMissingRecords(userId, 'categories', data.categories.map((category) => category.id));
-    await this.deleteMissingRecords(userId, 'accounts', data.accounts.map((account) => account.id));
+    await this.deleteMissingRecords(userId, 'categories', scopedData.categories.map((category) => category.id));
+    await this.deleteMissingRecords(userId, 'accounts', scopedData.accounts.map((account) => account.id));
   }
 
   async migrateFromLocal(localData: FinanceData): Promise<void> {
@@ -177,6 +178,49 @@ export class SupabaseFinanceRepository implements FinanceRepository {
       .in('id', staleIds);
     if (deleteError) throw deleteError;
   }
+}
+
+function scopeId(userId: string, id: string) {
+  return id.startsWith(`${userId}_`) ? id : `${userId}_${id}`;
+}
+
+function scopeFinanceDataToUser(data: FinanceData, userId: string): FinanceData {
+  const accountIds = new Map(data.accounts.map((account) => [account.id, scopeId(userId, account.id)]));
+  const categoryIds = new Map(data.categories.map((category) => [category.id, scopeId(userId, category.id)]));
+
+  return {
+    ...data,
+    accounts: data.accounts.map((account) => ({
+      ...account,
+      id: accountIds.get(account.id) ?? scopeId(userId, account.id),
+      userId
+    })),
+    categories: data.categories.map((category) => ({
+      ...category,
+      id: categoryIds.get(category.id) ?? scopeId(userId, category.id),
+      userId
+    })),
+    transactions: data.transactions.map((transaction) => ({
+      ...transaction,
+      id: scopeId(userId, transaction.id),
+      accountId: accountIds.get(transaction.accountId) ?? scopeId(userId, transaction.accountId),
+      categoryId: categoryIds.get(transaction.categoryId) ?? scopeId(userId, transaction.categoryId),
+      userId
+    })),
+    budgets: data.budgets.map((budget) => ({
+      ...budget,
+      id: scopeId(userId, budget.id),
+      categoryId: categoryIds.get(budget.categoryId) ?? scopeId(userId, budget.categoryId),
+      userId
+    })),
+    recurringItems: data.recurringItems.map((item) => ({
+      ...item,
+      id: scopeId(userId, item.id),
+      accountId: accountIds.get(item.accountId) ?? scopeId(userId, item.accountId),
+      categoryId: categoryIds.get(item.categoryId) ?? scopeId(userId, item.categoryId),
+      userId
+    }))
+  };
 }
 
 // DB to Domain mappers
