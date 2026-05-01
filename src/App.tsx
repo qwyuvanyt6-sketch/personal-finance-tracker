@@ -391,28 +391,39 @@ function App() {
         if (session) {
           const cloudRepository = new SupabaseFinanceRepository();
           try {
-            let loaded = await cloudRepository.load();
-            if (!hasFinanceRecords(loaded)) {
-              const localData = await localRepository.load();
+            let cloudData = await cloudRepository.load();
+            const localData = await localRepository.load();
+            
+            if (!hasFinanceRecords(cloudData)) {
+              // If no cloud data, migrate all local data
               await cloudRepository.migrateFromLocal(localData);
-              loaded = await cloudRepository.load();
+              cloudData = await cloudRepository.load();
+              setToast('LOADED: LOCAL_DATA_SAVED_TO_DATABASE');
+            } else {
+              // If cloud data exists, merge with any new local data
+              const mergedData = mergeFinanceData(cloudData, localData);
+              await cloudRepository.syncAll(mergedData);
+              cloudData = await cloudRepository.load();
+              setToast('LOADED: DATABASE_DATA_SYNCED');
             }
+            
             supabaseRepository = cloudRepository;
-            setData(loaded);
-            setTransactionForm(blankTransaction(loaded));
-            setRecurringForm(blankRecurring(loaded));
+            setData(cloudData);
+            setTransactionForm(blankTransaction(cloudData));
+            setRecurringForm(blankRecurring(cloudData));
             setIsSupabaseAuthenticated(true);
             setCurrentUserEmail(session.user.email ?? '');
             return;
-          } catch {
+          } catch (error) {
+            console.error('Cloud data load failed:', error);
             supabaseRepository = null;
             setIsSupabaseAuthenticated(false);
             setCurrentUserEmail('');
-            // Fall back to localStorage if Supabase load fails
+            setToast('DATABASE_LOAD_FAILED: USING_LOCAL_BROWSER_DATA');
           }
         }
       }
-      // Use localStorage
+      // Use localStorage as fallback
       const loaded = await localRepository.load();
       setData(loaded);
       setTransactionForm(blankTransaction(loaded));
@@ -425,8 +436,11 @@ function App() {
   useEffect(() => {
     if (!data) return;
     if (isSupabaseAuthenticated && supabaseRepository) {
-      supabaseRepository.save(data).catch(() => {
+      supabaseRepository.save(data).catch((error) => {
+        console.error('Database save failed:', error);
         setToast('DATABASE_SAVE_FAILED: LOCAL_COPY_STILL_ACTIVE');
+        // Fallback to local storage if database save fails
+        localRepository.save(data);
       });
     } else {
       localRepository.save(data);
@@ -538,12 +552,20 @@ function App() {
     const cloudRepository = new SupabaseFinanceRepository();
     try {
       let cloudData = await cloudRepository.load();
+      
+      // Always sync current local data to ensure nothing is lost
+      const localData = await localRepository.load();
+      
       if (!hasFinanceRecords(cloudData)) {
-        const localData = await localRepository.load();
+        // If no cloud data, migrate all local data
         await cloudRepository.migrateFromLocal(localData);
         cloudData = await cloudRepository.load();
         setToast('SIGNED_IN: LOCAL_DATA_SAVED_TO_DATABASE');
       } else {
+        // If cloud data exists, merge with any new local data
+        const mergedData = mergeFinanceData(cloudData, localData);
+        await cloudRepository.syncAll(mergedData);
+        cloudData = await cloudRepository.load();
         setToast('SIGNED_IN: DATABASE_DATA_LOADED');
       }
 
@@ -553,7 +575,8 @@ function App() {
       setRecurringForm(blankRecurring(cloudData));
       setIsSupabaseAuthenticated(true);
       setCurrentUserEmail(session.user.email ?? '');
-    } catch {
+    } catch (error) {
+      console.error('Database load failed:', error);
       supabaseRepository = null;
       setIsSupabaseAuthenticated(false);
       setCurrentUserEmail('');
@@ -752,7 +775,38 @@ function App() {
     setRecurringForm(blankRecurring(seed));
   };
 
-  const signOutOfDatabase = async () => {
+  const mergeFinanceData = (cloudData: FinanceData, localData: FinanceData): FinanceData => {
+  // Merge accounts, categories, transactions, budgets, and recurring items
+  // Prioritize cloud data but include any new local data
+  const merged: FinanceData = {
+    ...cloudData,
+    accounts: mergeById(cloudData.accounts, localData.accounts),
+    categories: mergeById(cloudData.categories, localData.categories),
+    transactions: mergeById(cloudData.transactions, localData.transactions),
+    budgets: mergeById(cloudData.budgets, localData.budgets),
+    recurringItems: mergeById(cloudData.recurringItems, localData.recurringItems),
+  };
+  return merged;
+};
+
+const mergeById = <T extends { id: string; updatedAt: string }>(cloudItems: T[], localItems: T[]): T[] => {
+  const merged = new Map<string, T>();
+  
+  // Add all cloud items
+  cloudItems.forEach(item => merged.set(item.id, item));
+  
+  // Add or update with local items (local takes precedence if newer)
+  localItems.forEach(item => {
+    const existing = merged.get(item.id);
+    if (!existing || new Date(item.updatedAt) > new Date(existing.updatedAt)) {
+      merged.set(item.id, item);
+    }
+  });
+  
+  return Array.from(merged.values());
+};
+
+const signOutOfDatabase = async () => {
     if (supabase) {
       await supabase.auth.signOut();
     }
